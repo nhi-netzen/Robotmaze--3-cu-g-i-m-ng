@@ -1,0 +1,214 @@
+#include <Wire.h>
+#include <VL53L0X.h>
+#include <Arduino.h>
+
+// ================== CẤU HÌNH PWM ==================
+#define PWM_FREQ 1000
+#define PWM_RES 8
+#define PWM_CHANNEL_L1 0
+#define PWM_CHANNEL_L2 1
+#define PWM_CHANNEL_R1 2
+#define PWM_CHANNEL_R2 3
+
+#define IN1_L 19
+#define IN2_L 18
+#define IN1_R 5
+#define IN2_R 17
+
+// ====== CHÂN ENCODER ======
+#define ENC_L 36
+#define ENC_R 34
+volatile long encCountL = 0;
+volatile long encCountR = 0;
+
+// ====== CẢM BIẾN ==================
+VL53L0X sensorFront, sensorLeft, sensorRight;
+#define I2C_SDA 21
+#define I2C_SCL 22
+#define TCA_ADDR 0x70
+
+#define TH_FRONT_SAFE 50
+#define TH_SIDE 70
+#define TURN_SPEED_SLOW 80
+#define PRE_TURN_DIST 30
+#define BACK_DIST 100  // mm, khoảng cách lùi khi dead-end
+
+// ====== PID & tốc độ ==================
+#define SPEED_BASE 90 
+#define KP 1.0
+#define KD 0.05 
+#define CELL_TICKS 750   // 1 ô
+#define LEFT_CORRECTION 0.98
+#define RIGHT_CORRECTION 1.06 
+// ================== ENCODER ISR ==================
+void IRAM_ATTR encL_ISR() { encCountL++; }
+void IRAM_ATTR encR_ISR() { encCountR++; }
+
+// ================== ĐỘNG CƠ ==================
+void setupMotors() {
+  ledcSetup(PWM_CHANNEL_L1, PWM_FREQ, PWM_RES);
+  ledcSetup(PWM_CHANNEL_L2, PWM_FREQ, PWM_RES);
+  ledcSetup(PWM_CHANNEL_R1, PWM_FREQ, PWM_RES);
+  ledcSetup(PWM_CHANNEL_R2, PWM_FREQ, PWM_RES);
+
+  ledcAttachPin(IN1_L, PWM_CHANNEL_L1);
+  ledcAttachPin(IN2_L, PWM_CHANNEL_L2);
+  ledcAttachPin(IN1_R, PWM_CHANNEL_R1);
+  ledcAttachPin(IN2_R, PWM_CHANNEL_R2);
+}
+
+void motorLeftForward(int spd) {
+  spd = constrain(spd, -255, 255);
+  if(spd >= 0) { ledcWrite(PWM_CHANNEL_L1, 0); ledcWrite(PWM_CHANNEL_L2, spd); }
+  else { ledcWrite(PWM_CHANNEL_L1, -spd); ledcWrite(PWM_CHANNEL_L2, 0); }
+}
+
+void motorRightForward(int spd) {
+  spd = constrain(spd, -255, 255);
+  if(spd >= 0) { ledcWrite(PWM_CHANNEL_R1, 0); ledcWrite(PWM_CHANNEL_R2, spd); }
+  else { ledcWrite(PWM_CHANNEL_R1, -spd); ledcWrite(PWM_CHANNEL_R2, 0); }
+}
+
+void stopMotors() { motorLeftForward(0); motorRightForward(0); }
+void resetEnc() { encCountL = 0; encCountR = 0; }
+
+// ================== ToF ==================
+void tcaSelect(uint8_t i) {
+  if(i>7) return;
+  Wire.beginTransmission(TCA_ADDR);
+  Wire.write(1 << i);
+  Wire.endTransmission();
+  delay(5);
+}
+
+int safeReadRange(VL53L0X &s) {
+  int v = s.readRangeContinuousMillimeters();
+  if(v <= 0) return 0;
+  if(v > 4000) v = 4000;
+  return v;
+}
+
+int readFront() { tcaSelect(3); return safeReadRange(sensorFront); }
+int readLeft()  { tcaSelect(2); return safeReadRange(sensorLeft); }
+int readRight() { tcaSelect(4); return safeReadRange(sensorRight); }
+
+// ================== DI CHUYỂN THEO PID ==================
+void forwardCell() {
+  resetEnc();
+  long lastError = 0;
+
+  while ((encCountL + encCountR)/2 < CELL_TICKS) {
+    int f = readFront();  // đọc front sensor liên tục
+    if(f <= TH_FRONT_SAFE) {  // quá gần → dừng ngay
+      stopMotors();
+      return;  // thoát forwardCell để loop xử lý lùi/quay
+    }
+
+    long error = encCountR - encCountL;
+    long adjust = KP*error + KD*(error - lastError);
+    lastError = error;
+
+    int leftSpd = constrain((SPEED_BASE - adjust) * LEFT_CORRECTION, 0, 255);
+    int rightSpd = constrain(SPEED_BASE + adjust, 0, 255);
+
+    motorLeftForward(leftSpd);
+    motorRightForward(rightSpd);
+    delay(2);
+  }
+
+  stopMotors();
+  delay(20);
+}
+
+void moveBackwardDistance(int mm) {
+  int targetTicks = mm * 4; // ticks/mm
+  resetEnc();
+  while ((encCountL + encCountR)/2 < targetTicks) {
+    motorLeftForward(-SPEED_BASE);
+    motorRightForward(-SPEED_BASE);
+    delay(2);
+  }
+  stopMotors();
+  delay(20);
+}
+
+// ================== XOAY 90° ==================
+void turn90(int sign) {
+  resetEnc();
+  int target = 250;
+  int spd = 140;           // tốc độ quay bình thường
+  int spd_slow_min = 120;  // tốc độ tối thiểu khi gần target
+
+  while ((abs(encCountL)+abs(encCountR))/2 < target) {
+    long traveled = (abs(encCountL)+abs(encCountR))/2;
+    if(target - traveled < 60) spd = spd_slow_min;
+
+    if(sign > 0) {
+        motorLeftForward(spd);
+        motorRightForward(-spd * RIGHT_CORRECTION);
+    } else {
+        motorLeftForward(-spd);
+        motorRightForward(spd * RIGHT_CORRECTION);
+    }
+
+    delay(3); // ổn định PWM
+  }
+
+  stopMotors(); // dừng khi đã quay đủ
+}
+
+// ================== SAFE TURN ==================
+void safeTurn(int direction) { // -1 trái, +1 phải
+  turn90(direction);
+}
+
+// ================== LOOP ==================
+void loop() {
+  int f = readFront();
+  int l = readLeft();
+  int r = readRight();
+
+  if(f > TH_FRONT_SAFE) {
+    // Đường trước thoáng → đi thẳng
+    forwardCell();
+  } else {
+    // Đường trước hẹp → kiểm tra 2 bên
+    l = readLeft();
+    r = readRight();
+
+    if(l > TH_SIDE || r > TH_SIDE) {
+      // Có ít nhất 1 bên đủ trống → quay bên trống hơn
+      if(l >= r) safeTurn(-1); // quay trái
+      else safeTurn(+1);       // quay phải
+    } else {
+      // Dead-end → lùi 1 đoạn rồi chọn bên trống hơn
+      moveBackwardDistance(BACK_DIST);
+
+      l = readLeft();
+      r = readRight();
+      if(l >= r) safeTurn(-1);
+      else safeTurn(+1);
+    }
+  }
+
+  delay(20);
+}
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  setupMotors();
+
+  pinMode(ENC_L, INPUT_PULLUP);
+  pinMode(ENC_R, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_L), encL_ISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_R), encR_ISR, RISING);
+
+  tcaSelect(2); delay(10); sensorLeft.init(true); sensorLeft.startContinuous();
+  tcaSelect(4); delay(10); sensorRight.init(true); sensorRight.startContinuous();
+  tcaSelect(3); delay(10); sensorFront.init(true); sensorFront.startContinuous();
+
+  Serial.println("Robot ready!");
+}
+
